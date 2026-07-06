@@ -63,6 +63,47 @@ if (!CONFIG.url || !CONFIG.user || !CONFIG.token) {
 // Basic Auth Header
 const AUTH_HEADER = 'Basic ' + Buffer.from(`${CONFIG.user}:${CONFIG.token}`).toString('base64');
 
+// User segment is interpolated into every DAV endpoint; encode once.
+const USER_ENC = encodeURIComponent(CONFIG.user);
+
+// Encode each path segment of a user-supplied remote path. Without this, a
+// '#' or '?' in a filename silently truncates the URL and the operation hits
+// the WRONG resource (dangerous with delete/upload), and '%' causes HTTP 400.
+function encodePath(p) {
+    const segments = String(p).split('/');
+    if (segments.some(seg => seg === '..')) {
+        throw new Error(`Invalid path '${p}': '..' segments are not allowed.`);
+    }
+    return segments.map(encodeURIComponent).join('/');
+}
+
+// Escape values interpolated into XML request bodies (PROPFIND/REPORT/SEARCH).
+// Unescaped '&' in a search query makes the server reject the body (HTTP 500).
+function xmlEscape(value) {
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&apos;');
+}
+
+// Escape TEXT property values per RFC 5545 §3.3.11 / RFC 6350 §3.4.
+// Without this, a newline in --description injects arbitrary iCal/vCard
+// properties into the object.
+function textEscape(value) {
+    return String(value)
+        .replace(/\\/g, '\\\\')
+        .replace(/\r?\n/g, '\\n')
+        .replace(/,/g, '\\,')
+        .replace(/;/g, '\\;');
+}
+
+// Non-fatal per-collection errors are collected here instead of being
+// silently swallowed: a swallowed REPORT failure used to turn into a fake
+// "0 results" success, which misleads the calling agent.
+const WARNINGS = [];
+
 // XML Parser
 const parser = new XMLParser({
     ignoreAttributes: false,
@@ -104,16 +145,20 @@ async function request(endpoint, options = {}) {
 }
 
 function output(data) {
-    console.log(JSON.stringify({
-        status: 'success',
-        data: data
-    }, null, 2));
+    const payload = { status: 'success', data: data };
+    if (WARNINGS.length > 0) payload.warnings = WARNINGS;
+    console.log(JSON.stringify(payload, null, 2));
 }
 
 function errorOutput(message) {
+    // Only expose the message: stack traces leak local paths into agent
+    // output. Full stack available with DEBUG=1.
+    const isError = message instanceof Error;
     console.error(JSON.stringify({
         status: 'error',
-        message: message.stack || message
+        message: process.env.DEBUG === '1' && isError && message.stack
+            ? message.stack
+            : (isError ? message.message : String(message))
     }, null, 2));
     process.exit(1);
 }
@@ -122,6 +167,18 @@ function ensureArray(item) {
     if (Array.isArray(item)) return item;
     if (item === undefined || item === null) return [];
     return [item];
+}
+
+// Pick the props of the propstat whose status is 200. WebDAV multistatus can
+// return several propstat blocks (200 + 404); blindly taking [0] is fragile.
+function okProps(r) {
+    const propstats = ensureArray(r && r['d:propstat']);
+    for (const ps of propstats) {
+        if (!ps || !ps['d:prop']) continue;
+        const status = ps['d:status'];
+        if (!status || String(status).includes('200')) return ps['d:prop'];
+    }
+    return null;
 }
 
 // Accept both ISO 8601 (2026-04-15T17:00:00Z) and CalDAV compact format (20260415T170000Z).
@@ -177,7 +234,7 @@ const Notes = {
         }));
     },
     async get(id) {
-        return await request(`/index.php/apps/notes/api/v1/notes/${id}`, {
+        return await request(`/index.php/apps/notes/api/v1/notes/${encodeURIComponent(id)}`, {
             headers: { 'Accept': 'application/json' }
         });
     },
@@ -223,7 +280,7 @@ const Notes = {
             throw new Error('Nothing to update. Provide title, content, or category.');
         }
 
-        const data = await request(`/index.php/apps/notes/api/v1/notes/${id}`, {
+        const data = await request(`/index.php/apps/notes/api/v1/notes/${encodeURIComponent(id)}`, {
             method: 'PUT',
             headers: {
                 'Content-Type': 'application/json',
@@ -237,7 +294,7 @@ const Notes = {
     async delete(id) {
         if (!id) throw new Error('Note ID is required for deletion.');
 
-        await request(`/index.php/apps/notes/api/v1/notes/${id}`, {
+        await request(`/index.php/apps/notes/api/v1/notes/${encodeURIComponent(id)}`, {
             method: 'DELETE',
             headers: {
                 'Accept': 'application/json'
@@ -252,7 +309,7 @@ const Notes = {
 const Files = {
     async list(dirPath = '/') {
         const cleanPath = dirPath.startsWith('/') ? dirPath.slice(1) : dirPath;
-        const endpoint = `/remote.php/dav/files/${CONFIG.user}/${cleanPath}`;
+        const endpoint = `/remote.php/dav/files/${USER_ENC}/${encodePath(cleanPath)}`;
 
         // Explicitly request oc:fileid alongside the standard DAV props.
         // Without an explicit body, default PROPFIND props are returned and oc:fileid is omitted.
@@ -282,19 +339,23 @@ const Files = {
         const responses = ensureArray(response['d:multistatus']['d:response']);
         const baseUrl = CONFIG.url.replace(/\/+$/, '');
 
+        // The requested collection itself is part of the multistatus; exclude
+        // it by comparing DECODED hrefs (encoded-vs-plain comparison used to
+        // fail, and the root listing leaked a parasite entry named after the
+        // user).
+        const requestedHref = `/remote.php/dav/files/${CONFIG.user}/${cleanPath}`
+            .replace(/\/{2,}/g, '/').replace(/\/+$/, '');
+
         return responses.map(r => {
             const href = r['d:href'];
-            const propstats = ensureArray(r['d:propstat']);
-            if (!propstats[0] || !propstats[0]['d:prop']) return null;
-            const props = propstats[0]['d:prop'];
+            const props = okProps(r);
+            if (!props) return null;
+
+            const decodedHref = decodeURIComponent(href).replace(/\/+$/, '');
+            if (decodedHref === requestedHref) return null;
 
             const isDir = props['d:resourcetype'] && props['d:resourcetype']['d:collection'] !== undefined;
             const name = decodeURIComponent(href.split('/').filter(p => p).pop());
-
-            if (href.endsWith(encodeURIComponent(CONFIG.user) + '/' + cleanPath) ||
-                href.endsWith(encodeURIComponent(CONFIG.user) + '/' + cleanPath + '/')) {
-                 if (cleanPath !== '' && name === cleanPath.split('/').pop()) return null;
-            }
 
             const fileId = props['oc:fileid'] != null ? String(props['oc:fileid']) : null;
 
@@ -320,49 +381,48 @@ const Files = {
             for (const seg of segments.slice(0, -1)) {
                 currentPath = currentPath ? `${currentPath}/${seg}` : seg;
                 try {
-                    await request(`/remote.php/dav/files/${CONFIG.user}/${currentPath}`, { method: 'MKCOL' });
+                    await request(`/remote.php/dav/files/${USER_ENC}/${encodePath(currentPath)}`, { method: 'MKCOL' });
                 } catch (e) {
                     if (e.status !== 405) throw e;
                 }
             }
         }
 
-        const endpoint = `/remote.php/dav/files/${CONFIG.user}/${cleanPath}`;
+        const endpoint = `/remote.php/dav/files/${USER_ENC}/${encodePath(cleanPath)}`;
 
         await request(endpoint, {
             method: 'PUT',
             headers: {
                 'Content-Type': 'application/octet-stream'
             },
-            body: content,
-            rawBody: true
+            body: content
         });
 
-        return { path: filePath, status: 'uploaded', size: content.length };
+        return { path: filePath, status: 'uploaded', size: Buffer.byteLength(content) };
     },
 
     async get(filePath) {
         const cleanPath = filePath.startsWith('/') ? filePath.slice(1) : filePath;
-        const endpoint = `/remote.php/dav/files/${CONFIG.user}/${cleanPath}`;
+        const endpoint = `/remote.php/dav/files/${USER_ENC}/${encodePath(cleanPath)}`;
 
         const response = await fetch(`${CONFIG.url}${endpoint}`, {
             method: 'GET',
-            headers: {
-                'Authorization': `Basic ${Buffer.from(`${CONFIG.user}:${CONFIG.token}`).toString('base64')}`
-            }
+            headers: { 'Authorization': AUTH_HEADER }
         });
 
         if (!response.ok) {
             throw new Error(`Request failed: HTTP ${response.status}: ${response.statusText}`);
         }
 
+        // Text-only by design (documented in SKILL.md): binaries would be
+        // corrupted by the text decoding. Size is reported in bytes.
         const content = await response.text();
-        return { path: filePath, content, size: content.length };
+        return { path: filePath, content, size: Buffer.byteLength(content) };
     },
 
     async delete(filePath) {
         const cleanPath = filePath.startsWith('/') ? filePath.slice(1) : filePath;
-        const endpoint = `/remote.php/dav/files/${CONFIG.user}/${cleanPath}`;
+        const endpoint = `/remote.php/dav/files/${USER_ENC}/${encodePath(cleanPath)}`;
 
         await request(endpoint, {
             method: 'DELETE'
@@ -387,7 +447,7 @@ const Files = {
                     </d:select>
                     <d:from>
                         <d:scope>
-                            <d:href>/files/${CONFIG.user}</d:href>
+                            <d:href>/files/${xmlEscape(CONFIG.user)}</d:href>
                             <d:depth>infinity</d:depth>
                         </d:scope>
                     </d:from>
@@ -396,7 +456,7 @@ const Files = {
                             <d:prop>
                                 <d:displayname/>
                             </d:prop>
-                            <d:literal>%${query}%</d:literal>
+                            <d:literal>%${xmlEscape(query)}%</d:literal>
                         </d:like>
                     </d:where>
                 </d:basicsearch>
@@ -405,7 +465,7 @@ const Files = {
 
         const response = await request(endpoint, {
             method: 'SEARCH',
-            headers: { 'Content-Type': 'application/xml' },
+            headers: { 'Content-Type': 'text/xml' },
             body: body
         });
 
@@ -415,9 +475,8 @@ const Files = {
 
         return responses.map(r => {
             const href = r['d:href'];
-            const propstats = ensureArray(r['d:propstat']);
-            if (!propstats[0] || !propstats[0]['d:prop']) return null;
-            const props = propstats[0]['d:prop'];
+            const props = okProps(r);
+            if (!props) return null;
 
             const isDir = props['d:resourcetype'] && props['d:resourcetype']['d:collection'] !== undefined;
             const fileId = props['oc:fileid'] != null ? String(props['oc:fileid']) : null;
@@ -438,8 +497,7 @@ const Files = {
 // 3. Calendar & Tasks (CalDAV)
 const CalDAV = {
     async findCalendars(componentType = null) {
-        // console.error("DEBUG: Entering findCalendars");
-        const endpoint = `/remote.php/dav/calendars/${CONFIG.user}/`;
+        const endpoint = `/remote.php/dav/calendars/${USER_ENC}/`;
         const response = await request(endpoint, {
             method: 'PROPFIND',
             headers: { 'Depth': '1' }
@@ -450,26 +508,26 @@ const CalDAV = {
         const responses = ensureArray(response['d:multistatus']['d:response']);
 
         return responses.map(r => {
-             const propstats = ensureArray(r['d:propstat']);
-             // console.error("DEBUG: Processing calendar propstat", JSON.stringify(propstats[0]));
-             if (!propstats[0] || !propstats[0]['d:prop']) return null;
-             const props = propstats[0]['d:prop'];
+             const props = okProps(r);
+             if (!props) return null;
 
              if (!props['d:resourcetype'] || !('cal:calendar' in props['d:resourcetype'])) return null;
 
-             // Get supported component type (VEVENT or VTODO)
-             let compType = null;
+             // Supported component types. cal:comp is an ARRAY for calendars
+             // that support several components (VEVENT+VTODO); assuming a
+             // single object silently excluded those calendars.
              const compSet = props['cal:supported-calendar-component-set'];
-             if (compSet && compSet['cal:comp']) {
-                 compType = compSet['cal:comp']['@_name'];
-             }
+             const componentTypes = ensureArray(compSet && compSet['cal:comp'])
+                 .map(c => c && c['@_name'])
+                 .filter(Boolean);
 
              return {
                  url: r['d:href'],
                  displayname: props['d:displayname'],
-                 componentType: compType
+                 componentType: componentTypes[0] || null,
+                 componentTypes: componentTypes
              };
-        }).filter(c => c && (!componentType || c.componentType === componentType));
+        }).filter(c => c && (!componentType || c.componentTypes.includes(componentType)));
     },
 
     async getEvents(start, end) {
@@ -512,10 +570,11 @@ const CalDAV = {
                  const responses = ensureArray(response['d:multistatus']['d:response']);
                  
                  for (const r of responses) {
-                     const propstats = ensureArray(r['d:propstat']);
-                     if (!propstats[0] || !propstats[0]['d:prop']) continue;
-                     
-                     const calData = propstats[0]['d:prop']['cal:calendar-data'];
+                     const props = okProps(r);
+                     if (!props) continue;
+
+                     const calData = props['cal:calendar-data'];
+                     if (!calData) continue;
 
                      const uidMatch = calData.match(/UID:(.*)/);
                      const summaryMatch = calData.match(/SUMMARY:(.*)/);
@@ -533,7 +592,7 @@ const CalDAV = {
                      });
                  }
              } catch (e) {
-                 // ignore errors for specific calendars
+                 WARNINGS.push(`Calendar '${cal.displayname}': ${e.message}`);
              }
         }
         return allEvents;
@@ -583,13 +642,12 @@ const CalDAV = {
                  const responses = ensureArray(response['d:multistatus']['d:response']);
                  
                  for (const r of responses) {
-                     const propstats = ensureArray(r['d:propstat']);
-                     // console.error("DEBUG: Processing todo propstat", JSON.stringify(propstats[0]));
-                     if (!propstats[0] || !propstats[0]['d:prop']) {
-                        continue; 
-                     }
-                     const calData = propstats[0]['d:prop']['cal:calendar-data'];
-                     
+                     const props = okProps(r);
+                     if (!props) continue;
+
+                     const calData = props['cal:calendar-data'];
+                     if (!calData) continue;
+
                      const summaryMatch = calData.match(/SUMMARY:(.*)/);
                      const statusMatch = calData.match(/STATUS:(.*)/);
                      const uidMatch = calData.match(/UID:(.*)/);
@@ -606,8 +664,7 @@ const CalDAV = {
                      });
                  }
              } catch (e) {
-                 // console.error("DEBUG: Error in calendar loop", e.message);
-                 // ignore
+                 WARNINGS.push(`Calendar '${cal.displayname}': ${e.message}`);
              }
         }
         return allTodos;
@@ -655,7 +712,7 @@ const CalDAV = {
                     <c:comp-filter name="VCALENDAR">
                         <c:comp-filter name="VTODO">
                              <c:prop-filter name="UID">
-                                <c:text-match collation="i;octet">${uid}</c:text-match>
+                                <c:text-match collation="i;octet">${xmlEscape(uid)}</c:text-match>
                              </c:prop-filter>
                         </c:comp-filter>
                     </c:comp-filter>
@@ -676,15 +733,18 @@ const CalDAV = {
                 const responses = ensureArray(response['d:multistatus']['d:response']);
                 
                 if (responses.length > 0) {
-                     const propstats = ensureArray(responses[0]['d:propstat']);
+                     const props = okProps(responses[0]);
+                     if (!props) continue;
                      return {
                         href: responses[0]['d:href'],
-                        etag: propstats[0]['d:prop']['d:getetag'],
-                        data: propstats[0]['d:prop']['cal:calendar-data'],
+                        etag: props['d:getetag'],
+                        data: props['cal:calendar-data'],
                         calendarUrl: cal.url
                     };
                 }
-            } catch(e) { /* ignore */ }
+            } catch(e) {
+                WARNINGS.push(`Calendar '${cal.displayname}': ${e.message}`);
+            }
         }
         return null;
     },
@@ -696,14 +756,16 @@ const CalDAV = {
         // Match an existing line including any property parameters (e.g. DUE;TZID=Europe/London:...).
         const regex = new RegExp(`^${prop}(?:;[^:\\r\\n]*)?:.*$`, 'm');
         const newLine = `${prop}:${value}`;
+        // Replacement is a function so '$&'/'$'' in user values are taken
+        // literally instead of being expanded as replacement patterns.
         if (regex.test(vcal)) {
-            return vcal.replace(regex, newLine);
+            return vcal.replace(regex, () => newLine);
         }
         const endMatch = vcal.match(/END:(VTODO|VEVENT)/);
         if (!endMatch) {
             throw new Error('Cannot insert property: no END:VTODO or END:VEVENT found in calendar data.');
         }
-        return vcal.replace(endMatch[0], `${newLine}\n${endMatch[0]}`);
+        return vcal.replace(endMatch[0], () => `${newLine}\n${endMatch[0]}`);
     },
 
     async createTask(title, calendarName, dueDate, priority, description) {
@@ -712,7 +774,7 @@ const CalDAV = {
         const now = new Date();
         const dtstamp = format(now, "yyyyMMdd'T'HHmmss'Z'");
 
-        let vtodo = `BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//OpenClaw//Nextcloud Skill//EN\nBEGIN:VTODO\nUID:${uid}\nDTSTAMP:${dtstamp}\nSUMMARY:${title}\nSTATUS:NEEDS-ACTION\n`;
+        let vtodo = `BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//OpenClaw//Nextcloud Skill//EN\nBEGIN:VTODO\nUID:${uid}\nDTSTAMP:${dtstamp}\nSUMMARY:${textEscape(title)}\nSTATUS:NEEDS-ACTION\n`;
 
         if (dueDate) {
              const due = parseDateInput(dueDate);
@@ -720,7 +782,7 @@ const CalDAV = {
         }
 
         if (priority) vtodo += `PRIORITY:${priority}\n`;
-        if (description) vtodo += `DESCRIPTION:${description}\n`;
+        if (description) vtodo += `DESCRIPTION:${textEscape(description)}\n`;
 
         vtodo += `END:VTODO\nEND:VCALENDAR`;
 
@@ -746,9 +808,9 @@ const CalDAV = {
         
         let vtodo = task.data;
         
-        if (updates.title) vtodo = this._updateProperty(vtodo, 'SUMMARY', updates.title);
+        if (updates.title) vtodo = this._updateProperty(vtodo, 'SUMMARY', textEscape(updates.title));
         if (updates.priority) vtodo = this._updateProperty(vtodo, 'PRIORITY', updates.priority);
-        if (updates.description) vtodo = this._updateProperty(vtodo, 'DESCRIPTION', updates.description);
+        if (updates.description) vtodo = this._updateProperty(vtodo, 'DESCRIPTION', textEscape(updates.description));
         if (updates.dueDate) {
              const due = parseDateInput(updates.dueDate);
              vtodo = this._updateProperty(vtodo, 'DUE', format(due, "yyyyMMdd'T'HHmmss'Z'"));
@@ -811,10 +873,10 @@ const CalDAV = {
             return d.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
         };
 
-        let vevent = `BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//OpenClaw//Nextcloud Skill//EN\nBEGIN:VEVENT\nUID:${uid}\nDTSTAMP:${dtstamp}\nSUMMARY:${summary}\nDTSTART:${toCalDavDate(start)}\nDTEND:${toCalDavDate(end)}\n`;
+        let vevent = `BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//OpenClaw//Nextcloud Skill//EN\nBEGIN:VEVENT\nUID:${uid}\nDTSTAMP:${dtstamp}\nSUMMARY:${textEscape(summary)}\nDTSTART:${toCalDavDate(start)}\nDTEND:${toCalDavDate(end)}\n`;
 
-        if (description) vevent += `DESCRIPTION:${description}\n`;
-        if (location) vevent += `LOCATION:${location}\n`;
+        if (description) vevent += `DESCRIPTION:${textEscape(description)}\n`;
+        if (location) vevent += `LOCATION:${textEscape(location)}\n`;
 
         vevent += `END:VEVENT\nEND:VCALENDAR`;
 
@@ -856,7 +918,7 @@ const CalDAV = {
                     <c:comp-filter name="VCALENDAR">
                         <c:comp-filter name="VEVENT">
                             <c:prop-filter name="UID">
-                                <c:text-match collation="i;octet">${uid}</c:text-match>
+                                <c:text-match collation="i;octet">${xmlEscape(uid)}</c:text-match>
                             </c:prop-filter>
                         </c:comp-filter>
                     </c:comp-filter>
@@ -877,15 +939,18 @@ const CalDAV = {
                 const responses = ensureArray(response['d:multistatus']['d:response']);
 
                 if (responses.length > 0) {
-                    const propstats = ensureArray(responses[0]['d:propstat']);
+                    const props = okProps(responses[0]);
+                    if (!props) continue;
                     return {
                         href: responses[0]['d:href'],
-                        etag: propstats[0]['d:prop']['d:getetag'],
-                        data: propstats[0]['d:prop']['cal:calendar-data'],
+                        etag: props['d:getetag'],
+                        data: props['cal:calendar-data'],
                         calendarUrl: cal.url
                     };
                 }
-            } catch(e) { /* ignore */ }
+            } catch(e) {
+                WARNINGS.push(`Calendar '${cal.displayname}': ${e.message}`);
+            }
         }
         return null;
     },
@@ -896,7 +961,7 @@ const CalDAV = {
 
         let vevent = event.data;
 
-        if (updates.summary) vevent = this._updateProperty(vevent, 'SUMMARY', updates.summary);
+        if (updates.summary) vevent = this._updateProperty(vevent, 'SUMMARY', textEscape(updates.summary));
         if (updates.start) {
             const d = parseDateInput(updates.start);
             vevent = this._updateProperty(vevent, 'DTSTART', d.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z');
@@ -906,10 +971,10 @@ const CalDAV = {
             vevent = this._updateProperty(vevent, 'DTEND', d.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z');
         }
         if (updates.description !== undefined) {
-            vevent = this._updateProperty(vevent, 'DESCRIPTION', updates.description);
+            vevent = this._updateProperty(vevent, 'DESCRIPTION', textEscape(updates.description));
         }
         if (updates.location !== undefined) {
-            vevent = this._updateProperty(vevent, 'LOCATION', updates.location);
+            vevent = this._updateProperty(vevent, 'LOCATION', textEscape(updates.location));
         }
 
         await request(event.href, {
@@ -955,7 +1020,7 @@ const Shares = {
             shareWith: s.share_with || null,
             permissions: s.permissions,
             token: s.token || null,
-            url: s.url || (s.token ? `${baseUrl}/s/${s.token}` : null),
+            url: s.url || (s.token ? `${baseUrl}/index.php/s/${s.token}` : null),
             expireDate: s.expiration || null
         };
     },
@@ -1015,7 +1080,7 @@ const Shares = {
 // 5. Contacts (CardDAV)
 const Contacts = {
     async findAddressBooks() {
-        const endpoint = `/remote.php/dav/addressbooks/users/${CONFIG.user}/`;
+        const endpoint = `/remote.php/dav/addressbooks/users/${USER_ENC}/`;
         const response = await request(endpoint, {
             method: 'PROPFIND',
             headers: { 'Depth': '1' }
@@ -1026,9 +1091,8 @@ const Contacts = {
         const responses = ensureArray(response['d:multistatus']['d:response']);
 
         return responses.map(r => {
-            const propstats = ensureArray(r['d:propstat']);
-            if (!propstats[0] || !propstats[0]['d:prop']) return null;
-            const props = propstats[0]['d:prop'];
+            const props = okProps(r);
+            if (!props) return null;
 
             // Check if it's an address book (has card:addressbook in resourcetype)
             if (!props['d:resourcetype'] || !('card:addressbook' in props['d:resourcetype'])) return null;
@@ -1101,10 +1165,10 @@ const Contacts = {
                 const responses = ensureArray(response['d:multistatus']['d:response']);
 
                 for (const r of responses) {
-                    const propstats = ensureArray(r['d:propstat']);
-                    if (!propstats[0] || !propstats[0]['d:prop']) continue;
+                    const props = okProps(r);
+                    if (!props) continue;
 
-                    const cardData = propstats[0]['d:prop']['card:address-data'];
+                    const cardData = props['card:address-data'];
                     if (!cardData) continue;
 
                     const contact = this._parseVCard(cardData);
@@ -1113,7 +1177,7 @@ const Contacts = {
                     allContacts.push(contact);
                 }
             } catch (e) {
-                // ignore errors for individual address books
+                WARNINGS.push(`Address book '${ab.displayname}': ${e.message}`);
             }
         }
         return allContacts;
@@ -1193,7 +1257,7 @@ const Contacts = {
                 </d:prop>
                 <card:filter>
                     <card:prop-filter name="UID">
-                        <card:text-match collation="i;octet">${uid}</card:text-match>
+                        <card:text-match collation="i;octet">${xmlEscape(uid)}</card:text-match>
                     </card:prop-filter>
                 </card:filter>
             </card:addressbook-query>
@@ -1212,15 +1276,18 @@ const Contacts = {
                 const responses = ensureArray(response['d:multistatus']['d:response']);
 
                 if (responses.length > 0) {
-                    const propstats = ensureArray(responses[0]['d:propstat']);
+                    const props = okProps(responses[0]);
+                    if (!props) continue;
                     return {
                         href: responses[0]['d:href'],
-                        etag: propstats[0]['d:prop']['d:getetag'],
-                        data: propstats[0]['d:prop']['card:address-data'],
+                        etag: props['d:getetag'],
+                        data: props['card:address-data'],
                         addressBookUrl: ab.url
                     };
                 }
-            } catch(e) { /* ignore */ }
+            } catch(e) {
+                WARNINGS.push(`Address book '${ab.displayname}': ${e.message}`);
+            }
         }
         return null;
     },
@@ -1229,23 +1296,24 @@ const Contacts = {
         const ab = await this.getAddressBook(addressBookName);
         const uid = crypto.randomUUID();
 
-        let vcard = `BEGIN:VCARD\nVERSION:3.0\nUID:${uid}\nFN:${fullName}\n`;
+        let vcard = `BEGIN:VCARD\nVERSION:3.0\nUID:${uid}\nFN:${textEscape(fullName)}\n`;
 
-        // Parse name into structured format if possible
+        // Parse name into structured format if possible. Each N component is
+        // escaped separately so user semicolons cannot shift the fields.
         const nameParts = fullName.split(' ');
         if (nameParts.length >= 2) {
             const lastName = nameParts[nameParts.length - 1];
             const firstName = nameParts.slice(0, -1).join(' ');
-            vcard += `N:${lastName};${firstName};;;\n`;
+            vcard += `N:${textEscape(lastName)};${textEscape(firstName)};;;\n`;
         } else {
-            vcard += `N:${fullName};;;;\n`;
+            vcard += `N:${textEscape(fullName)};;;;\n`;
         }
 
-        if (options.email) vcard += `EMAIL:${options.email}\n`;
-        if (options.phone) vcard += `TEL:${options.phone}\n`;
-        if (options.organization) vcard += `ORG:${options.organization}\n`;
-        if (options.title) vcard += `TITLE:${options.title}\n`;
-        if (options.note) vcard += `NOTE:${options.note}\n`;
+        if (options.email) vcard += `EMAIL:${textEscape(options.email)}\n`;
+        if (options.phone) vcard += `TEL:${textEscape(options.phone)}\n`;
+        if (options.organization) vcard += `ORG:${textEscape(options.organization)}\n`;
+        if (options.title) vcard += `TITLE:${textEscape(options.title)}\n`;
+        if (options.note) vcard += `NOTE:${textEscape(options.note)}\n`;
 
         vcard += `END:VCARD`;
 
@@ -1268,10 +1336,11 @@ const Contacts = {
     _updateVCardField(vcard, field, value) {
         const regex = new RegExp(`^${field}(?:;[^:]*)?:.*$`, 'mi');
         const newLine = `${field}:${value}`;
+        // Function replacements: '$&' in user values must stay literal.
         if (regex.test(vcard)) {
-            return vcard.replace(regex, newLine);
+            return vcard.replace(regex, () => newLine);
         } else {
-            return vcard.replace('END:VCARD', `${newLine}\nEND:VCARD`);
+            return vcard.replace('END:VCARD', () => `${newLine}\nEND:VCARD`);
         }
     },
 
@@ -1282,20 +1351,20 @@ const Contacts = {
         let vcard = contact.data;
 
         if (updates.fullName) {
-            vcard = this._updateVCardField(vcard, 'FN', updates.fullName);
+            vcard = this._updateVCardField(vcard, 'FN', textEscape(updates.fullName));
             // Update structured name too
             const nameParts = updates.fullName.split(' ');
             if (nameParts.length >= 2) {
                 const lastName = nameParts[nameParts.length - 1];
                 const firstName = nameParts.slice(0, -1).join(' ');
-                vcard = this._updateVCardField(vcard, 'N', `${lastName};${firstName};;;`);
+                vcard = this._updateVCardField(vcard, 'N', `${textEscape(lastName)};${textEscape(firstName)};;;`);
             }
         }
-        if (updates.email) vcard = this._updateVCardField(vcard, 'EMAIL', updates.email);
-        if (updates.phone) vcard = this._updateVCardField(vcard, 'TEL', updates.phone);
-        if (updates.organization) vcard = this._updateVCardField(vcard, 'ORG', updates.organization);
-        if (updates.title) vcard = this._updateVCardField(vcard, 'TITLE', updates.title);
-        if (updates.note) vcard = this._updateVCardField(vcard, 'NOTE', updates.note);
+        if (updates.email) vcard = this._updateVCardField(vcard, 'EMAIL', textEscape(updates.email));
+        if (updates.phone) vcard = this._updateVCardField(vcard, 'TEL', textEscape(updates.phone));
+        if (updates.organization) vcard = this._updateVCardField(vcard, 'ORG', textEscape(updates.organization));
+        if (updates.title) vcard = this._updateVCardField(vcard, 'TITLE', textEscape(updates.title));
+        if (updates.note) vcard = this._updateVCardField(vcard, 'NOTE', textEscape(updates.note));
 
         await request(contact.href, {
             method: 'PUT',
@@ -1342,16 +1411,16 @@ const Contacts = {
                 </d:prop>
                 <card:filter test="anyof">
                     <card:prop-filter name="FN">
-                        <card:text-match collation="i;unicode-casemap" match-type="contains">${query}</card:text-match>
+                        <card:text-match collation="i;unicode-casemap" match-type="contains">${xmlEscape(query)}</card:text-match>
                     </card:prop-filter>
                     <card:prop-filter name="EMAIL">
-                        <card:text-match collation="i;unicode-casemap" match-type="contains">${query}</card:text-match>
+                        <card:text-match collation="i;unicode-casemap" match-type="contains">${xmlEscape(query)}</card:text-match>
                     </card:prop-filter>
                     <card:prop-filter name="TEL">
-                        <card:text-match collation="i;unicode-casemap" match-type="contains">${query}</card:text-match>
+                        <card:text-match collation="i;unicode-casemap" match-type="contains">${xmlEscape(query)}</card:text-match>
                     </card:prop-filter>
                     <card:prop-filter name="ORG">
-                        <card:text-match collation="i;unicode-casemap" match-type="contains">${query}</card:text-match>
+                        <card:text-match collation="i;unicode-casemap" match-type="contains">${xmlEscape(query)}</card:text-match>
                     </card:prop-filter>
                 </card:filter>
             </card:addressbook-query>
@@ -1369,10 +1438,10 @@ const Contacts = {
                 const responses = ensureArray(response['d:multistatus']['d:response']);
 
                 for (const r of responses) {
-                    const propstats = ensureArray(r['d:propstat']);
-                    if (!propstats[0] || !propstats[0]['d:prop']) continue;
+                    const props = okProps(r);
+                    if (!props) continue;
 
-                    const cardData = propstats[0]['d:prop']['card:address-data'];
+                    const cardData = props['card:address-data'];
                     if (!cardData) continue;
 
                     const contact = this._parseVCard(cardData);
@@ -1381,7 +1450,7 @@ const Contacts = {
                     allContacts.push(contact);
                 }
             } catch (e) {
-                // ignore errors for individual address books
+                WARNINGS.push(`Address book '${ab.displayname}': ${e.message}`);
             }
         }
         return allContacts;
@@ -1626,7 +1695,7 @@ async function main() {
                 if (type === 'tasks') componentType = 'VTODO';
                 else if (type === 'events') componentType = 'VEVENT';
                 const calendars = await CalDAV.findCalendars(componentType);
-                output(calendars.map(c => ({ name: c.displayname, type: c.componentType === 'VTODO' ? 'tasks' : 'events' })));
+                output(calendars.map(c => ({ name: c.displayname, type: c.componentTypes.includes('VTODO') ? 'tasks' : 'events' })));
             } else {
                 throw new Error('Unknown calendars command');
             }

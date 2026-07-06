@@ -17636,6 +17636,21 @@ if (!CONFIG.url || !CONFIG.user || !CONFIG.token) {
   }
 }
 var AUTH_HEADER = "Basic " + Buffer2.from(`${CONFIG.user}:${CONFIG.token}`).toString("base64");
+var USER_ENC = encodeURIComponent(CONFIG.user);
+function encodePath(p) {
+  const segments = String(p).split("/");
+  if (segments.some((seg) => seg === "..")) {
+    throw new Error(`Invalid path '${p}': '..' segments are not allowed.`);
+  }
+  return segments.map(encodeURIComponent).join("/");
+}
+function xmlEscape(value) {
+  return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+}
+function textEscape(value) {
+  return String(value).replace(/\\/g, "\\\\").replace(/\r?\n/g, "\\n").replace(/,/g, "\\,").replace(/;/g, "\\;");
+}
+var WARNINGS = [];
 var parser = new XMLParser({
   ignoreAttributes: false,
   attributeNamePrefix: "@_"
@@ -17670,15 +17685,15 @@ async function request(endpoint, options = {}) {
   }
 }
 function output(data) {
-  console.log(JSON.stringify({
-    status: "success",
-    data
-  }, null, 2));
+  const payload = { status: "success", data };
+  if (WARNINGS.length > 0) payload.warnings = WARNINGS;
+  console.log(JSON.stringify(payload, null, 2));
 }
 function errorOutput(message) {
+  const isError = message instanceof Error;
   console.error(JSON.stringify({
     status: "error",
-    message: message.stack || message
+    message: process.env.DEBUG === "1" && isError && message.stack ? message.stack : isError ? message.message : String(message)
   }, null, 2));
   process.exit(1);
 }
@@ -17686,6 +17701,15 @@ function ensureArray(item) {
   if (Array.isArray(item)) return item;
   if (item === void 0 || item === null) return [];
   return [item];
+}
+function okProps(r) {
+  const propstats = ensureArray(r && r["d:propstat"]);
+  for (const ps of propstats) {
+    if (!ps || !ps["d:prop"]) continue;
+    const status = ps["d:status"];
+    if (!status || String(status).includes("200")) return ps["d:prop"];
+  }
+  return null;
 }
 function matchByName(items, name) {
   if (!name) return null;
@@ -17730,7 +17754,7 @@ var Notes = {
     }));
   },
   async get(id) {
-    return await request(`/index.php/apps/notes/api/v1/notes/${id}`, {
+    return await request(`/index.php/apps/notes/api/v1/notes/${encodeURIComponent(id)}`, {
       headers: { "Accept": "application/json" }
     });
   },
@@ -17771,7 +17795,7 @@ var Notes = {
     if (Object.keys(payload).length === 0) {
       throw new Error("Nothing to update. Provide title, content, or category.");
     }
-    const data = await request(`/index.php/apps/notes/api/v1/notes/${id}`, {
+    const data = await request(`/index.php/apps/notes/api/v1/notes/${encodeURIComponent(id)}`, {
       method: "PUT",
       headers: {
         "Content-Type": "application/json",
@@ -17783,7 +17807,7 @@ var Notes = {
   },
   async delete(id) {
     if (!id) throw new Error("Note ID is required for deletion.");
-    await request(`/index.php/apps/notes/api/v1/notes/${id}`, {
+    await request(`/index.php/apps/notes/api/v1/notes/${encodeURIComponent(id)}`, {
       method: "DELETE",
       headers: {
         "Accept": "application/json"
@@ -17795,7 +17819,7 @@ var Notes = {
 var Files = {
   async list(dirPath = "/") {
     const cleanPath = dirPath.startsWith("/") ? dirPath.slice(1) : dirPath;
-    const endpoint = `/remote.php/dav/files/${CONFIG.user}/${cleanPath}`;
+    const endpoint = `/remote.php/dav/files/${USER_ENC}/${encodePath(cleanPath)}`;
     const propfindBody = `<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
   <d:prop>
@@ -17818,16 +17842,15 @@ var Files = {
     }
     const responses = ensureArray(response["d:multistatus"]["d:response"]);
     const baseUrl = CONFIG.url.replace(/\/+$/, "");
+    const requestedHref = `/remote.php/dav/files/${CONFIG.user}/${cleanPath}`.replace(/\/{2,}/g, "/").replace(/\/+$/, "");
     return responses.map((r) => {
       const href = r["d:href"];
-      const propstats = ensureArray(r["d:propstat"]);
-      if (!propstats[0] || !propstats[0]["d:prop"]) return null;
-      const props = propstats[0]["d:prop"];
+      const props = okProps(r);
+      if (!props) return null;
+      const decodedHref = decodeURIComponent(href).replace(/\/+$/, "");
+      if (decodedHref === requestedHref) return null;
       const isDir = props["d:resourcetype"] && props["d:resourcetype"]["d:collection"] !== void 0;
       const name = decodeURIComponent(href.split("/").filter((p) => p).pop());
-      if (href.endsWith(encodeURIComponent(CONFIG.user) + "/" + cleanPath) || href.endsWith(encodeURIComponent(CONFIG.user) + "/" + cleanPath + "/")) {
-        if (cleanPath !== "" && name === cleanPath.split("/").pop()) return null;
-      }
       const fileId = props["oc:fileid"] != null ? String(props["oc:fileid"]) : null;
       return {
         name,
@@ -17848,41 +17871,38 @@ var Files = {
       for (const seg of segments.slice(0, -1)) {
         currentPath = currentPath ? `${currentPath}/${seg}` : seg;
         try {
-          await request(`/remote.php/dav/files/${CONFIG.user}/${currentPath}`, { method: "MKCOL" });
+          await request(`/remote.php/dav/files/${USER_ENC}/${encodePath(currentPath)}`, { method: "MKCOL" });
         } catch (e) {
           if (e.status !== 405) throw e;
         }
       }
     }
-    const endpoint = `/remote.php/dav/files/${CONFIG.user}/${cleanPath}`;
+    const endpoint = `/remote.php/dav/files/${USER_ENC}/${encodePath(cleanPath)}`;
     await request(endpoint, {
       method: "PUT",
       headers: {
         "Content-Type": "application/octet-stream"
       },
-      body: content,
-      rawBody: true
+      body: content
     });
-    return { path: filePath, status: "uploaded", size: content.length };
+    return { path: filePath, status: "uploaded", size: Buffer2.byteLength(content) };
   },
   async get(filePath) {
     const cleanPath = filePath.startsWith("/") ? filePath.slice(1) : filePath;
-    const endpoint = `/remote.php/dav/files/${CONFIG.user}/${cleanPath}`;
+    const endpoint = `/remote.php/dav/files/${USER_ENC}/${encodePath(cleanPath)}`;
     const response = await fetch(`${CONFIG.url}${endpoint}`, {
       method: "GET",
-      headers: {
-        "Authorization": `Basic ${Buffer2.from(`${CONFIG.user}:${CONFIG.token}`).toString("base64")}`
-      }
+      headers: { "Authorization": AUTH_HEADER }
     });
     if (!response.ok) {
       throw new Error(`Request failed: HTTP ${response.status}: ${response.statusText}`);
     }
     const content = await response.text();
-    return { path: filePath, content, size: content.length };
+    return { path: filePath, content, size: Buffer2.byteLength(content) };
   },
   async delete(filePath) {
     const cleanPath = filePath.startsWith("/") ? filePath.slice(1) : filePath;
-    const endpoint = `/remote.php/dav/files/${CONFIG.user}/${cleanPath}`;
+    const endpoint = `/remote.php/dav/files/${USER_ENC}/${encodePath(cleanPath)}`;
     await request(endpoint, {
       method: "DELETE"
     });
@@ -17904,7 +17924,7 @@ var Files = {
                     </d:select>
                     <d:from>
                         <d:scope>
-                            <d:href>/files/${CONFIG.user}</d:href>
+                            <d:href>/files/${xmlEscape(CONFIG.user)}</d:href>
                             <d:depth>infinity</d:depth>
                         </d:scope>
                     </d:from>
@@ -17913,7 +17933,7 @@ var Files = {
                             <d:prop>
                                 <d:displayname/>
                             </d:prop>
-                            <d:literal>%${query}%</d:literal>
+                            <d:literal>%${xmlEscape(query)}%</d:literal>
                         </d:like>
                     </d:where>
                 </d:basicsearch>
@@ -17921,7 +17941,7 @@ var Files = {
         `;
     const response = await request(endpoint, {
       method: "SEARCH",
-      headers: { "Content-Type": "application/xml" },
+      headers: { "Content-Type": "text/xml" },
       body
     });
     if (!response["d:multistatus"] || !response["d:multistatus"]["d:response"]) return [];
@@ -17929,9 +17949,8 @@ var Files = {
     const baseUrl = CONFIG.url.replace(/\/+$/, "");
     return responses.map((r) => {
       const href = r["d:href"];
-      const propstats = ensureArray(r["d:propstat"]);
-      if (!propstats[0] || !propstats[0]["d:prop"]) return null;
-      const props = propstats[0]["d:prop"];
+      const props = okProps(r);
+      if (!props) return null;
       const isDir = props["d:resourcetype"] && props["d:resourcetype"]["d:collection"] !== void 0;
       const fileId = props["oc:fileid"] != null ? String(props["oc:fileid"]) : null;
       return {
@@ -17948,7 +17967,7 @@ var Files = {
 };
 var CalDAV = {
   async findCalendars(componentType = null) {
-    const endpoint = `/remote.php/dav/calendars/${CONFIG.user}/`;
+    const endpoint = `/remote.php/dav/calendars/${USER_ENC}/`;
     const response = await request(endpoint, {
       method: "PROPFIND",
       headers: { "Depth": "1" }
@@ -17956,21 +17975,18 @@ var CalDAV = {
     if (!response["d:multistatus"] || !response["d:multistatus"]["d:response"]) return [];
     const responses = ensureArray(response["d:multistatus"]["d:response"]);
     return responses.map((r) => {
-      const propstats = ensureArray(r["d:propstat"]);
-      if (!propstats[0] || !propstats[0]["d:prop"]) return null;
-      const props = propstats[0]["d:prop"];
+      const props = okProps(r);
+      if (!props) return null;
       if (!props["d:resourcetype"] || !("cal:calendar" in props["d:resourcetype"])) return null;
-      let compType = null;
       const compSet = props["cal:supported-calendar-component-set"];
-      if (compSet && compSet["cal:comp"]) {
-        compType = compSet["cal:comp"]["@_name"];
-      }
+      const componentTypes = ensureArray(compSet && compSet["cal:comp"]).map((c) => c && c["@_name"]).filter(Boolean);
       return {
         url: r["d:href"],
         displayname: props["d:displayname"],
-        componentType: compType
+        componentType: componentTypes[0] || null,
+        componentTypes
       };
-    }).filter((c) => c && (!componentType || c.componentType === componentType));
+    }).filter((c) => c && (!componentType || c.componentTypes.includes(componentType)));
   },
   async getEvents(start, end) {
     const calendars = await this.findCalendars("VEVENT");
@@ -18006,9 +18022,10 @@ var CalDAV = {
         if (!response["d:multistatus"] || !response["d:multistatus"]["d:response"]) continue;
         const responses = ensureArray(response["d:multistatus"]["d:response"]);
         for (const r of responses) {
-          const propstats = ensureArray(r["d:propstat"]);
-          if (!propstats[0] || !propstats[0]["d:prop"]) continue;
-          const calData = propstats[0]["d:prop"]["cal:calendar-data"];
+          const props = okProps(r);
+          if (!props) continue;
+          const calData = props["cal:calendar-data"];
+          if (!calData) continue;
           const uidMatch = calData.match(/UID:(.*)/);
           const summaryMatch = calData.match(/SUMMARY:(.*)/);
           const dtstartMatch = calData.match(/DTSTART(?:;.*)?:(.*)/);
@@ -18024,6 +18041,7 @@ var CalDAV = {
           });
         }
       } catch (e) {
+        WARNINGS.push(`Calendar '${cal.displayname}': ${e.message}`);
       }
     }
     return allEvents;
@@ -18067,11 +18085,10 @@ var CalDAV = {
         if (!response["d:multistatus"] || !response["d:multistatus"]["d:response"]) continue;
         const responses = ensureArray(response["d:multistatus"]["d:response"]);
         for (const r of responses) {
-          const propstats = ensureArray(r["d:propstat"]);
-          if (!propstats[0] || !propstats[0]["d:prop"]) {
-            continue;
-          }
-          const calData = propstats[0]["d:prop"]["cal:calendar-data"];
+          const props = okProps(r);
+          if (!props) continue;
+          const calData = props["cal:calendar-data"];
+          if (!calData) continue;
           const summaryMatch = calData.match(/SUMMARY:(.*)/);
           const statusMatch = calData.match(/STATUS:(.*)/);
           const uidMatch = calData.match(/UID:(.*)/);
@@ -18087,6 +18104,7 @@ var CalDAV = {
           });
         }
       } catch (e) {
+        WARNINGS.push(`Calendar '${cal.displayname}': ${e.message}`);
       }
     }
     return allTodos;
@@ -18130,7 +18148,7 @@ var CalDAV = {
                     <c:comp-filter name="VCALENDAR">
                         <c:comp-filter name="VTODO">
                              <c:prop-filter name="UID">
-                                <c:text-match collation="i;octet">${uid}</c:text-match>
+                                <c:text-match collation="i;octet">${xmlEscape(uid)}</c:text-match>
                              </c:prop-filter>
                         </c:comp-filter>
                     </c:comp-filter>
@@ -18147,15 +18165,17 @@ var CalDAV = {
         if (!response["d:multistatus"] || !response["d:multistatus"]["d:response"]) continue;
         const responses = ensureArray(response["d:multistatus"]["d:response"]);
         if (responses.length > 0) {
-          const propstats = ensureArray(responses[0]["d:propstat"]);
+          const props = okProps(responses[0]);
+          if (!props) continue;
           return {
             href: responses[0]["d:href"],
-            etag: propstats[0]["d:prop"]["d:getetag"],
-            data: propstats[0]["d:prop"]["cal:calendar-data"],
+            etag: props["d:getetag"],
+            data: props["cal:calendar-data"],
             calendarUrl: cal.url
           };
         }
       } catch (e) {
+        WARNINGS.push(`Calendar '${cal.displayname}': ${e.message}`);
       }
     }
     return null;
@@ -18167,13 +18187,13 @@ var CalDAV = {
     const regex = new RegExp(`^${prop}(?:;[^:\\r\\n]*)?:.*$`, "m");
     const newLine = `${prop}:${value}`;
     if (regex.test(vcal)) {
-      return vcal.replace(regex, newLine);
+      return vcal.replace(regex, () => newLine);
     }
     const endMatch = vcal.match(/END:(VTODO|VEVENT)/);
     if (!endMatch) {
       throw new Error("Cannot insert property: no END:VTODO or END:VEVENT found in calendar data.");
     }
-    return vcal.replace(endMatch[0], `${newLine}
+    return vcal.replace(endMatch[0], () => `${newLine}
 ${endMatch[0]}`);
   },
   async createTask(title, calendarName, dueDate, priority, description) {
@@ -18187,7 +18207,7 @@ PRODID:-//OpenClaw//Nextcloud Skill//EN
 BEGIN:VTODO
 UID:${uid}
 DTSTAMP:${dtstamp}
-SUMMARY:${title}
+SUMMARY:${textEscape(title)}
 STATUS:NEEDS-ACTION
 `;
     if (dueDate) {
@@ -18197,7 +18217,7 @@ STATUS:NEEDS-ACTION
     }
     if (priority) vtodo += `PRIORITY:${priority}
 `;
-    if (description) vtodo += `DESCRIPTION:${description}
+    if (description) vtodo += `DESCRIPTION:${textEscape(description)}
 `;
     vtodo += `END:VTODO
 END:VCALENDAR`;
@@ -18218,9 +18238,9 @@ END:VCALENDAR`;
     const task = await this.findTaskPath(uid, calendarName);
     if (!task) throw new Error(`Task ${uid} not found.`);
     let vtodo = task.data;
-    if (updates.title) vtodo = this._updateProperty(vtodo, "SUMMARY", updates.title);
+    if (updates.title) vtodo = this._updateProperty(vtodo, "SUMMARY", textEscape(updates.title));
     if (updates.priority) vtodo = this._updateProperty(vtodo, "PRIORITY", updates.priority);
-    if (updates.description) vtodo = this._updateProperty(vtodo, "DESCRIPTION", updates.description);
+    if (updates.description) vtodo = this._updateProperty(vtodo, "DESCRIPTION", textEscape(updates.description));
     if (updates.dueDate) {
       const due = parseDateInput(updates.dueDate);
       vtodo = this._updateProperty(vtodo, "DUE", (0, import_date_fns.format)(due, "yyyyMMdd'T'HHmmss'Z'"));
@@ -18278,13 +18298,13 @@ PRODID:-//OpenClaw//Nextcloud Skill//EN
 BEGIN:VEVENT
 UID:${uid}
 DTSTAMP:${dtstamp}
-SUMMARY:${summary}
+SUMMARY:${textEscape(summary)}
 DTSTART:${toCalDavDate(start)}
 DTEND:${toCalDavDate(end)}
 `;
-    if (description) vevent += `DESCRIPTION:${description}
+    if (description) vevent += `DESCRIPTION:${textEscape(description)}
 `;
-    if (location) vevent += `LOCATION:${location}
+    if (location) vevent += `LOCATION:${textEscape(location)}
 `;
     vevent += `END:VEVENT
 END:VCALENDAR`;
@@ -18322,7 +18342,7 @@ END:VCALENDAR`;
                     <c:comp-filter name="VCALENDAR">
                         <c:comp-filter name="VEVENT">
                             <c:prop-filter name="UID">
-                                <c:text-match collation="i;octet">${uid}</c:text-match>
+                                <c:text-match collation="i;octet">${xmlEscape(uid)}</c:text-match>
                             </c:prop-filter>
                         </c:comp-filter>
                     </c:comp-filter>
@@ -18339,15 +18359,17 @@ END:VCALENDAR`;
         if (!response["d:multistatus"] || !response["d:multistatus"]["d:response"]) continue;
         const responses = ensureArray(response["d:multistatus"]["d:response"]);
         if (responses.length > 0) {
-          const propstats = ensureArray(responses[0]["d:propstat"]);
+          const props = okProps(responses[0]);
+          if (!props) continue;
           return {
             href: responses[0]["d:href"],
-            etag: propstats[0]["d:prop"]["d:getetag"],
-            data: propstats[0]["d:prop"]["cal:calendar-data"],
+            etag: props["d:getetag"],
+            data: props["cal:calendar-data"],
             calendarUrl: cal.url
           };
         }
       } catch (e) {
+        WARNINGS.push(`Calendar '${cal.displayname}': ${e.message}`);
       }
     }
     return null;
@@ -18356,7 +18378,7 @@ END:VCALENDAR`;
     const event = await this.findEventPath(uid, calendarName);
     if (!event) throw new Error(`Event ${uid} not found.`);
     let vevent = event.data;
-    if (updates.summary) vevent = this._updateProperty(vevent, "SUMMARY", updates.summary);
+    if (updates.summary) vevent = this._updateProperty(vevent, "SUMMARY", textEscape(updates.summary));
     if (updates.start) {
       const d = parseDateInput(updates.start);
       vevent = this._updateProperty(vevent, "DTSTART", d.toISOString().replace(/[-:]/g, "").split(".")[0] + "Z");
@@ -18366,10 +18388,10 @@ END:VCALENDAR`;
       vevent = this._updateProperty(vevent, "DTEND", d.toISOString().replace(/[-:]/g, "").split(".")[0] + "Z");
     }
     if (updates.description !== void 0) {
-      vevent = this._updateProperty(vevent, "DESCRIPTION", updates.description);
+      vevent = this._updateProperty(vevent, "DESCRIPTION", textEscape(updates.description));
     }
     if (updates.location !== void 0) {
-      vevent = this._updateProperty(vevent, "LOCATION", updates.location);
+      vevent = this._updateProperty(vevent, "LOCATION", textEscape(updates.location));
     }
     await request(event.href, {
       method: "PUT",
@@ -18408,7 +18430,7 @@ var Shares = {
       shareWith: s.share_with || null,
       permissions: s.permissions,
       token: s.token || null,
-      url: s.url || (s.token ? `${baseUrl}/s/${s.token}` : null),
+      url: s.url || (s.token ? `${baseUrl}/index.php/s/${s.token}` : null),
       expireDate: s.expiration || null
     };
   },
@@ -18463,7 +18485,7 @@ var Shares = {
 };
 var Contacts = {
   async findAddressBooks() {
-    const endpoint = `/remote.php/dav/addressbooks/users/${CONFIG.user}/`;
+    const endpoint = `/remote.php/dav/addressbooks/users/${USER_ENC}/`;
     const response = await request(endpoint, {
       method: "PROPFIND",
       headers: { "Depth": "1" }
@@ -18471,9 +18493,8 @@ var Contacts = {
     if (!response["d:multistatus"] || !response["d:multistatus"]["d:response"]) return [];
     const responses = ensureArray(response["d:multistatus"]["d:response"]);
     return responses.map((r) => {
-      const propstats = ensureArray(r["d:propstat"]);
-      if (!propstats[0] || !propstats[0]["d:prop"]) return null;
-      const props = propstats[0]["d:prop"];
+      const props = okProps(r);
+      if (!props) return null;
       if (!props["d:resourcetype"] || !("card:addressbook" in props["d:resourcetype"])) return null;
       let name = props["d:displayname"];
       if (!name) {
@@ -18532,9 +18553,9 @@ var Contacts = {
         if (!response["d:multistatus"] || !response["d:multistatus"]["d:response"]) continue;
         const responses = ensureArray(response["d:multistatus"]["d:response"]);
         for (const r of responses) {
-          const propstats = ensureArray(r["d:propstat"]);
-          if (!propstats[0] || !propstats[0]["d:prop"]) continue;
-          const cardData = propstats[0]["d:prop"]["card:address-data"];
+          const props = okProps(r);
+          if (!props) continue;
+          const cardData = props["card:address-data"];
           if (!cardData) continue;
           const contact = this._parseVCard(cardData);
           contact.addressBook = ab.displayname;
@@ -18542,6 +18563,7 @@ var Contacts = {
           allContacts.push(contact);
         }
       } catch (e) {
+        WARNINGS.push(`Address book '${ab.displayname}': ${e.message}`);
       }
     }
     return allContacts;
@@ -18608,7 +18630,7 @@ var Contacts = {
                 </d:prop>
                 <card:filter>
                     <card:prop-filter name="UID">
-                        <card:text-match collation="i;octet">${uid}</card:text-match>
+                        <card:text-match collation="i;octet">${xmlEscape(uid)}</card:text-match>
                     </card:prop-filter>
                 </card:filter>
             </card:addressbook-query>
@@ -18623,15 +18645,17 @@ var Contacts = {
         if (!response["d:multistatus"] || !response["d:multistatus"]["d:response"]) continue;
         const responses = ensureArray(response["d:multistatus"]["d:response"]);
         if (responses.length > 0) {
-          const propstats = ensureArray(responses[0]["d:propstat"]);
+          const props = okProps(responses[0]);
+          if (!props) continue;
           return {
             href: responses[0]["d:href"],
-            etag: propstats[0]["d:prop"]["d:getetag"],
-            data: propstats[0]["d:prop"]["card:address-data"],
+            etag: props["d:getetag"],
+            data: props["card:address-data"],
             addressBookUrl: ab.url
           };
         }
       } catch (e) {
+        WARNINGS.push(`Address book '${ab.displayname}': ${e.message}`);
       }
     }
     return null;
@@ -18642,27 +18666,27 @@ var Contacts = {
     let vcard = `BEGIN:VCARD
 VERSION:3.0
 UID:${uid}
-FN:${fullName}
+FN:${textEscape(fullName)}
 `;
     const nameParts = fullName.split(" ");
     if (nameParts.length >= 2) {
       const lastName = nameParts[nameParts.length - 1];
       const firstName = nameParts.slice(0, -1).join(" ");
-      vcard += `N:${lastName};${firstName};;;
+      vcard += `N:${textEscape(lastName)};${textEscape(firstName)};;;
 `;
     } else {
-      vcard += `N:${fullName};;;;
+      vcard += `N:${textEscape(fullName)};;;;
 `;
     }
-    if (options.email) vcard += `EMAIL:${options.email}
+    if (options.email) vcard += `EMAIL:${textEscape(options.email)}
 `;
-    if (options.phone) vcard += `TEL:${options.phone}
+    if (options.phone) vcard += `TEL:${textEscape(options.phone)}
 `;
-    if (options.organization) vcard += `ORG:${options.organization}
+    if (options.organization) vcard += `ORG:${textEscape(options.organization)}
 `;
-    if (options.title) vcard += `TITLE:${options.title}
+    if (options.title) vcard += `TITLE:${textEscape(options.title)}
 `;
-    if (options.note) vcard += `NOTE:${options.note}
+    if (options.note) vcard += `NOTE:${textEscape(options.note)}
 `;
     vcard += `END:VCARD`;
     const filename = `${uid}.vcf`;
@@ -18682,9 +18706,9 @@ FN:${fullName}
     const regex = new RegExp(`^${field}(?:;[^:]*)?:.*$`, "mi");
     const newLine = `${field}:${value}`;
     if (regex.test(vcard)) {
-      return vcard.replace(regex, newLine);
+      return vcard.replace(regex, () => newLine);
     } else {
-      return vcard.replace("END:VCARD", `${newLine}
+      return vcard.replace("END:VCARD", () => `${newLine}
 END:VCARD`);
     }
   },
@@ -18693,19 +18717,19 @@ END:VCARD`);
     if (!contact) throw new Error(`Contact ${uid} not found.`);
     let vcard = contact.data;
     if (updates.fullName) {
-      vcard = this._updateVCardField(vcard, "FN", updates.fullName);
+      vcard = this._updateVCardField(vcard, "FN", textEscape(updates.fullName));
       const nameParts = updates.fullName.split(" ");
       if (nameParts.length >= 2) {
         const lastName = nameParts[nameParts.length - 1];
         const firstName = nameParts.slice(0, -1).join(" ");
-        vcard = this._updateVCardField(vcard, "N", `${lastName};${firstName};;;`);
+        vcard = this._updateVCardField(vcard, "N", `${textEscape(lastName)};${textEscape(firstName)};;;`);
       }
     }
-    if (updates.email) vcard = this._updateVCardField(vcard, "EMAIL", updates.email);
-    if (updates.phone) vcard = this._updateVCardField(vcard, "TEL", updates.phone);
-    if (updates.organization) vcard = this._updateVCardField(vcard, "ORG", updates.organization);
-    if (updates.title) vcard = this._updateVCardField(vcard, "TITLE", updates.title);
-    if (updates.note) vcard = this._updateVCardField(vcard, "NOTE", updates.note);
+    if (updates.email) vcard = this._updateVCardField(vcard, "EMAIL", textEscape(updates.email));
+    if (updates.phone) vcard = this._updateVCardField(vcard, "TEL", textEscape(updates.phone));
+    if (updates.organization) vcard = this._updateVCardField(vcard, "ORG", textEscape(updates.organization));
+    if (updates.title) vcard = this._updateVCardField(vcard, "TITLE", textEscape(updates.title));
+    if (updates.note) vcard = this._updateVCardField(vcard, "NOTE", textEscape(updates.note));
     await request(contact.href, {
       method: "PUT",
       headers: {
@@ -18743,16 +18767,16 @@ END:VCARD`);
                 </d:prop>
                 <card:filter test="anyof">
                     <card:prop-filter name="FN">
-                        <card:text-match collation="i;unicode-casemap" match-type="contains">${query}</card:text-match>
+                        <card:text-match collation="i;unicode-casemap" match-type="contains">${xmlEscape(query)}</card:text-match>
                     </card:prop-filter>
                     <card:prop-filter name="EMAIL">
-                        <card:text-match collation="i;unicode-casemap" match-type="contains">${query}</card:text-match>
+                        <card:text-match collation="i;unicode-casemap" match-type="contains">${xmlEscape(query)}</card:text-match>
                     </card:prop-filter>
                     <card:prop-filter name="TEL">
-                        <card:text-match collation="i;unicode-casemap" match-type="contains">${query}</card:text-match>
+                        <card:text-match collation="i;unicode-casemap" match-type="contains">${xmlEscape(query)}</card:text-match>
                     </card:prop-filter>
                     <card:prop-filter name="ORG">
-                        <card:text-match collation="i;unicode-casemap" match-type="contains">${query}</card:text-match>
+                        <card:text-match collation="i;unicode-casemap" match-type="contains">${xmlEscape(query)}</card:text-match>
                     </card:prop-filter>
                 </card:filter>
             </card:addressbook-query>
@@ -18767,9 +18791,9 @@ END:VCARD`);
         if (!response["d:multistatus"] || !response["d:multistatus"]["d:response"]) continue;
         const responses = ensureArray(response["d:multistatus"]["d:response"]);
         for (const r of responses) {
-          const propstats = ensureArray(r["d:propstat"]);
-          if (!propstats[0] || !propstats[0]["d:prop"]) continue;
-          const cardData = propstats[0]["d:prop"]["card:address-data"];
+          const props = okProps(r);
+          if (!props) continue;
+          const cardData = props["card:address-data"];
           if (!cardData) continue;
           const contact = this._parseVCard(cardData);
           contact.addressBook = ab.displayname;
@@ -18777,6 +18801,7 @@ END:VCARD`);
           allContacts.push(contact);
         }
       } catch (e) {
+        WARNINGS.push(`Address book '${ab.displayname}': ${e.message}`);
       }
     }
     return allContacts;
@@ -18974,7 +18999,7 @@ async function main() {
         if (type === "tasks") componentType = "VTODO";
         else if (type === "events") componentType = "VEVENT";
         const calendars = await CalDAV.findCalendars(componentType);
-        output(calendars.map((c) => ({ name: c.displayname, type: c.componentType === "VTODO" ? "tasks" : "events" })));
+        output(calendars.map((c) => ({ name: c.displayname, type: c.componentTypes.includes("VTODO") ? "tasks" : "events" })));
       } else {
         throw new Error("Unknown calendars command");
       }

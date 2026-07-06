@@ -1,11 +1,11 @@
 ---
 name: openclaw-nextcloud
 description: Manage Notes, Tasks, Calendar, Files, and Contacts in your Nextcloud instance via CalDAV, WebDAV, and Notes API. Use for creating notes, managing todos and calendar events, uploading/downloading files, and managing contacts.
-compatibility: Requires Node.js 20+ and a Nextcloud app password (NEXTCLOUD_TOKEN) granting full account-scope access. Reads NEXTCLOUD_URL, NEXTCLOUD_USER, NEXTCLOUD_TOKEN. HTTPS-only egress to NEXTCLOUD_URL. Performs destructive, non-transactional writes (delete/edit/share); see Safety section in body.
+compatibility: Requires Node.js 20.19+ (or 22.7+) and a Nextcloud app password (NEXTCLOUD_TOKEN) granting full account-scope access. Reads NEXTCLOUD_URL, NEXTCLOUD_USER, NEXTCLOUD_TOKEN. HTTPS-only egress to NEXTCLOUD_URL. Performs destructive, non-transactional writes (delete/edit/share); see Safety section in body.
 allowed-tools: Bash Read
 metadata:
   openclaw:
-    version: 0.2.3
+    version: 0.2.4
     requires:
       env:
         - NEXTCLOUD_URL
@@ -37,7 +37,7 @@ This skill provides integration with a Nextcloud instance. It supports access to
 
 ## Requirements
 
-- **Node.js 20+** on PATH (`node scripts/nextcloud.js`).
+- **Node.js 20.19+ (or 22.7+)** on PATH (the script relies on automatic ES-module syntax detection) (`node scripts/nextcloud.js`).
 - **Network egress** to `NEXTCLOUD_URL` only — the skill makes no other outbound calls.
 - **Environment variables** (see Configuration below). All three are required at runtime; without them the script exits with a clear error before making any request.
 
@@ -62,7 +62,7 @@ Before invoking any of the commands below, confirm with the user — even if the
 | Command | Why confirmation matters |
 |---|---|
 | `notes delete --id <id>` | Permanently deletes a note. |
-| `files delete --path <path>` | Permanently deletes a file or folder (no Trash semantics from this API). |
+| `files delete --path <path>` | Deletes a file or folder. Goes to the Nextcloud trash bin (restorable) when the Deleted files app is active — do not present as irreversible. |
 | `tasks delete --uid <uid>` | Permanently deletes a task. |
 | `calendar delete --uid <uid>` | Permanently deletes a calendar event. |
 | `contacts delete --uid <uid>` | Permanently deletes a contact. |
@@ -138,7 +138,7 @@ node scripts/nextcloud.js <command> <subcommand> [options]
 ### Files
 - `files list [--path <path>]`
 - `files search --query <q>`
-- `files get --path <path>` (download file content)
+- `files get --path <path>` (download file content — TEXT files only; binary content would be corrupted)
 - `files upload --path <path> --content <content>` — missing parent directories are created automatically
 - `files delete --path <path>`
 
@@ -264,6 +264,8 @@ Date inputs (`--due`, `--start`, `--end`, `--from`, `--to`) accept either ISO 86
   "data": [ ... ]
 }
 ```
+
+When a per-calendar/per-addressbook request fails during a multi-collection read, the command still succeeds but a `warnings` array is added next to `data` — treat non-empty `warnings` as "results may be incomplete", never as plain zero results.
 
 or
 
